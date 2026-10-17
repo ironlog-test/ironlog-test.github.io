@@ -1,0 +1,166 @@
+# Publishes the IronLog test build to the stand.
+#
+# Manual only: this workflow runs on workflow_dispatch and on nothing else — not
+# on push, not on a schedule, not from another workflow. The deploy job sits in
+# the protected `github-pages` environment, so a run stops and waits for the
+# owner's approval before a single byte reaches the site.
+#
+# The published revision is always the head of `test-deploy` in tmksdm/IronLog,
+# resolved at run time; the source tree is fetched anonymously, so the run holds
+# no credential for the source repository.
+
+name: Publish test build
+
+on:
+  workflow_dispatch:
+
+# Minimal permissions: the source tree is fetched over plain HTTPS.
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    outputs:
+      build_id: ${{ steps.version.outputs.build_id }}
+      revision: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve the head of test-deploy
+        id: source
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/tmksdm/IronLog.git refs/heads/test-deploy | cut -f1)
+          if [ -z "$sha" ]; then
+            echo "::error::tmksdm/IronLog has no branch test-deploy"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Publishing test-deploy at \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fetch the source tree
+        run: |
+          set -euo pipefail
+          curl -sSL --fail \
+            "https://codeload.github.com/tmksdm/IronLog/tar.gz/${{ steps.source.outputs.sha }}" \
+            -o source.tar.gz
+          mkdir source
+          tar -xzf source.tar.gz -C source --strip-components=1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        working-directory: source
+        run: npm ci
+
+      - name: Lint and test the published revision
+        working-directory: source
+        run: |
+          npm run lint
+          npm test
+
+      - name: Build the test bundle
+        working-directory: source
+        env:
+          # Part of sw.js and of version.json: without a new id a republished
+          # build would be byte-identical and would never reach an installed PWA.
+          IRONLOG_BUILD_ID: ${{ steps.source.outputs.sha }}
+        run: |
+          IRONLOG_MODULE_GRAPH=node_modules/module-graph.txt npm run build:test
+
+      # Proves the test identity (CSP, manifest, cache prefix), the offline
+      # precache and the entry closure — and self-tests each of those checks.
+      - name: Verify the test artifact
+        working-directory: source
+        run: |
+          node scripts/ci/check-artifacts.mjs --mode test --dir dist \
+            --module-graph node_modules/module-graph.txt --self-test \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Read the published build id
+        id: version
+        working-directory: source
+        run: |
+          echo "build_id=$(node -p "require('./dist/version.json').buildId")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: source/dist
+
+  deploy:
+    name: deploy (waits for approval)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  # The published bytes, not the intent: what the site serves must be the build
+  # this run produced.
+  verify:
+    name: verify
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the deployed artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: published
+
+      - name: Compare the served site with the built artifact
+        env:
+          BUILD_ID: ${{ needs.build.outputs.build_id }}
+        run: |
+          set -euo pipefail
+          mkdir served
+          tar -xzf published/artifact.tar -C served
+
+          served_build_id=''
+          for attempt in $(seq 1 12); do
+            served_build_id=$(curl -sSL --fail \
+              "https://ironlog-test.github.io/version.json?cachebust=$RANDOM" \
+              | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).buildId" || true)
+            if [ "$served_build_id" = "$BUILD_ID" ]; then break; fi
+            echo "Attempt $attempt: the site serves '$served_build_id', expected '$BUILD_ID'"
+            sleep 15
+          done
+
+          if [ "$served_build_id" != "$BUILD_ID" ]; then
+            echo "::error::the site does not serve build $BUILD_ID (got '$served_build_id')"
+            exit 1
+          fi
+
+          curl -sSL --fail "https://ironlog-test.github.io/" -o served-index.html
+          built=$(sha256sum served/index.html | cut -d' ' -f1)
+          live=$(sha256sum served-index.html | cut -d' ' -f1)
+          if [ "$built" != "$live" ]; then
+            echo "::error::index.html served by the site differs from the built artifact"
+            exit 1
+          fi
+
+          if ! grep -q "connect-src 'self'" served-index.html; then
+            echo "::error::the served shell carries no test CSP"
+            exit 1
+          fi
+
+          {
+            echo "### Stand publication verified"
+            echo ""
+            echo "- source revision: \`${{ needs.build.outputs.revision }}\`"
+            echo "- build id: \`$BUILD_ID\`"
+            echo "- index.html sha256: \`$live\`"
+          } >> "$GITHUB_STEP_SUMMARY"
