@@ -1,0 +1,17 @@
+# The stand builds a checkout of tmksdm/IronLog; build output must never be
+# committed here.
+node_modules/
+dist/
+dist-ssr/
+dist-*/
+
+# Local archives and logs
+*.tgz
+*.zip
+*.log
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
