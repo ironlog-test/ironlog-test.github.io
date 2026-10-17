@@ -127,7 +127,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir served
-          tar -xzf published/artifact.tar -C served
+          # artifact.tar is an uncompressed tar, so no -z: it would fail with
+          # "not in gzip format" before anything is compared.
+          tar -xf published/artifact.tar -C served
 
           served_build_id=''
           for attempt in $(seq 1 12); do
